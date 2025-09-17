@@ -1,0 +1,9 @@
+
+SAR_AF_DATA_PATH: ""  # 数据集路径
+
+filenames: [
+
+] # 数据集文件
+
+trainid: []    # 训练集id
+
