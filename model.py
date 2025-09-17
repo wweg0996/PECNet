@@ -1,5 +1,12 @@
+"""
+PECNet (Phase Error Correction Network) Model
+相位误差校正网络模型
+
+基于卷积神经网络和Transformer的混合架构，用于双地基合成孔径雷达图像相位误差校正
+"""
+
 import time
-from dataset import saveimage
+from PECNet.dataset import saveimage
 import matplotlib.pyplot as plt
 import torch as th
 import torch.nn as nn
@@ -7,7 +14,16 @@ from collections import OrderedDict
 import torchbox as tb
 
 
-class Focuser(nn.Module):
+class PECNet(nn.Module):
+    """
+    Args:
+        Na (int): 方位向样本数
+        Nr (int): 距离向样本数  
+        convp (list): 卷积层参数配置
+        ftshift (bool): 是否进行频移
+        seed (int): 随机种子
+    """
+
     def __init__(self, Na, Nr, convp, ftshift=True, seed=None):
         super().__init__()
         self.Na = Na
@@ -47,28 +63,25 @@ class Focuser(nn.Module):
             FD['relu' + str(n + 1)] = nn.LeakyReLU()
             FD['dropout' + str(n + 1)] = nn.Dropout2d(p=0.2)
 
-        # 这里你可以选择只对宽度方向做池化 (None,1) 等
         FD['gapool'] = nn.AdaptiveAvgPool2d((None, 1))
 
         self.features = nn.Sequential(FD)
 
         # ========== Transformer 设置 ========== #
-        # 让 Transformer 的 d_model 与卷积输出通道数相同 (last_channels)
         last_channels = convp[-1][0]
 
-        # 创建一个 TransformerEncoder (示例:2层, 4头, FFN=512)
+        # TransformerEncoder (2层, 4头, FFN=512)
         encoder_layer = nn.TransformerEncoderLayer(
-            d_model=last_channels,  # 输入向量维度
+            d_model=last_channels,  
             nhead=4,
             dim_feedforward=512,
-            batch_first=True  # 重要: 保证输入形状为(N, seq_len, d_model)
+            batch_first=True  
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=2
         )
 
-        # 用一个简单的 1D pooling 将 Transformer 输出聚合成全局向量
         self.pool = nn.AdaptiveAvgPool1d(1)
 
         # ========== 相位预测层 ========== #
@@ -78,43 +91,37 @@ class Focuser(nn.Module):
             nn.Dropout(0.4),
             nn.Linear(512, Na)  # 输出 [N, Na]
         )
-        # self.phase_predictor = nn.Sequential(
-        #     nn.Linear(last_channels, 128),  # 可选隐藏层
-        #     nn.LeakyReLU(0.1, inplace=True),
-        #     nn.Linear(128, 1)  # 关键：每个时刻输出 1 个标量相位
-        # )
 
         if self.seed is not None:
             th.manual_seed(seed)
 
     def forward(self, X):
         """
-        X: [N, H, W, 2] (假设)，最后一维 (实部, 虚部)
+        前向传播
+        
+        Args:
+            X (torch.Tensor): 输入张量 [N, H, W, 2]，最后一维为(实部, 虚部)
+            
+        Returns:
+            tuple: (校正后的信号, 预测的相位误差)
+                - X (torch.Tensor): 校正后的复数信号
+                - pa (torch.Tensor): 预测的相位误差 [N, Na]
         """
-        d = X.dim()  # 一般=4
-        # => [N, 2, H, W]
+        d = X.dim()  
         Y = th.stack((X[..., 0], X[..., 1]), dim=1)
 
-        # 1) 卷积特征提取 => [N, C, H', 1]
         feats = self.features(Y)
-        feats = feats.squeeze(dim=-1)  # => [N, C, H']
-        # => [N, H', C] (batch_first=True)
+        feats = feats.squeeze(dim=-1)  
         feats = feats.permute(0, 2, 1)
 
-        # 2) TransformerEncoder => [N, H', C]
         out = self.transformer(feats)
 
-        # 3) 池化 => 先变为 [N, C, H'] 再做自适应平均池化到 1
-        out = out.permute(0, 2, 1)  # => [N, C, H']
-        out = self.pool(out)  # => [N, C, 1]
-        out = out.squeeze(-1)  # => [N, C]
+        out = out.permute(0, 2, 1)  
+        out = self.pool(out)  
+        out = out.squeeze(-1)  
 
-        # 4) 相位预测 => [N, Na]
         pa = self.phase_predictor(out)
-        # pa = self.phase_predictor(out)  # [N, H', 1]
-        # pa = pa.squeeze(-1)  # [N, H']  (即 [N, Na])
 
-        # 5) 构造相位校正 e^{j·theta} 并与 X 做 FFT/乘法
         sizea = [1] * d
         sizea[0], sizea[-3], sizea[-2], sizea[-1] = pa.size(0), pa.size(1), 1, 2
         epa = th.stack((th.cos(pa), -th.sin(pa)), dim=-1)
@@ -127,6 +134,12 @@ class Focuser(nn.Module):
         return X, pa
 
     def weights_init(self, m):
+        """
+        权重初始化
+        
+        Args:
+            m: 网络模块
+        """
         if isinstance(m, th.nn.Conv2d):
             th.nn.init.orthogonal_(m.weight.data, th.nn.init.calculate_gain('leaky_relu'))
             m.bias.data.zero_()
@@ -136,6 +149,24 @@ class Focuser(nn.Module):
 
     def train_epoch(self, X, sizeBatch, loss_ent_func, loss_cts_func, loss_fro_func, loss_type, epoch, optimizer,
                     scheduler, device):
+        """
+        训练一个epoch
+        
+        Args:
+            X (torch.Tensor): 训练数据
+            sizeBatch (int): 批次大小
+            loss_ent_func: 熵损失函数
+            loss_cts_func: 对比度损失函数
+            loss_fro_func: Frobenius范数损失函数
+            loss_type (str): 损失类型
+            epoch (int): 当前epoch
+            optimizer: 优化器
+            scheduler: 学习率调度器
+            device: 设备
+            
+        Returns:
+            float: 平均训练损失
+        """
         self.train()
 
         tstart = time.time()
@@ -144,23 +175,17 @@ class Focuser(nn.Module):
         numBatch = int(numSamples / sizeBatch)
         idx = tb.randperm(0, numSamples, numSamples)
         lossENTv, lossCTSv, lossFROv, lossvtrain = 0., 0., 0., 0.
-        # t1, t2, t3 = 0., 0., 0.
         for b in range(numBatch):
-            # tstart1 = time.time()
             i = idx[b * sizeBatch:(b + 1) * sizeBatch]
             xi = X[i]
             xi = xi.to(device)
 
             optimizer.zero_grad()
-            # x,pre
             fi, casi = self.forward(xi)
-            # tend1 = time.time()
 
-            # tstart2 = time.time()
             lossENT = loss_ent_func(fi)
             lossCTS = loss_cts_func(fi)
             lossFRO = loss_fro_func(fi)
-            # tend2 = time.time()
 
             if loss_type == 'Entropy':
                 loss = lossENT
@@ -173,21 +198,15 @@ class Focuser(nn.Module):
 
             loss.backward()
 
-            # tstart3 = time.time()
             lossvtrain += loss.item()
             lossCTSv += lossCTS.item()
             lossENTv += lossENT.item()
             lossFROv += lossFRO.item()
-            # tend3 = time.time()
 
             optimizer.step()
 
             if scheduler is not None:
                 scheduler.step()
-
-            # t1 += tend1 - tstart1
-            # t2 += tend2 - tstart2
-            # t3 += tend3 - tstart3
 
         tend = time.time()
 
@@ -195,12 +214,27 @@ class Focuser(nn.Module):
         lossCTSv /= numBatch
         lossENTv /= numBatch
         lossFROv /= numBatch
-        # print(t1, t2, t3)
         print("--->Train epoch: %d, loss: %.4f, entropy: %.4f, l1norm: %.4f, contrast: %.4f, time: %ss" %
               (epoch, lossvtrain, lossENTv, lossFROv, lossCTSv, tend - tstart))
         return lossvtrain
 
     def valid_epoch(self, X, sizeBatch, loss_ent_func, loss_cts_func, loss_fro_func, loss_type, epoch, device):
+        """
+        验证一个epoch
+        
+        Args:
+            X (torch.Tensor): 验证数据
+            sizeBatch (int): 批次大小
+            loss_ent_func: 熵损失函数
+            loss_cts_func: 对比度损失函数
+            loss_fro_func: Frobenius范数损失函数
+            loss_type (str): 损失类型
+            epoch (int): 当前epoch
+            device: 设备
+            
+        Returns:
+            float: 平均验证损失
+        """
         self.eval()
 
         tstart = time.time()
@@ -248,6 +282,22 @@ class Focuser(nn.Module):
         return lossvvalid
 
     def test_epoch(self, X, sizeBatch, loss_ent_func, loss_cts_func, loss_fro_func, loss_type, epoch, device):
+        """
+        测试一个epoch
+        
+        Args:
+            X (torch.Tensor): 测试数据
+            sizeBatch (int): 批次大小
+            loss_ent_func: 熵损失函数
+            loss_cts_func: 对比度损失函数
+            loss_fro_func: Frobenius范数损失函数
+            loss_type (str): 损失类型
+            epoch (int): 当前epoch
+            device: 设备
+            
+        Returns:
+            float: 平均测试损失
+        """
         self.eval()
 
         tstart = time.time()
@@ -295,6 +345,16 @@ class Focuser(nn.Module):
         return lossvtest
 
     def visual_epoch(self, X, sizeBatch, loss_ent_func, loss_cts_func, device):
+        """
+        可视化epoch（用于多聚焦器场景）
+        
+        Args:
+            X (torch.Tensor): 输入数据
+            sizeBatch (int): 批次大小
+            loss_ent_func: 熵损失函数
+            loss_cts_func: 对比度损失函数
+            device: 设备
+        """
         self.eval()
 
         numSamples = X.shape[0]
@@ -323,7 +383,17 @@ class Focuser(nn.Module):
                 saveimage(X, X, [0, 1, 2], prefixname='visual%d' % n, outfolder='snapshot/')
 
     def plot(self, xi, pai, idx, prefixname, outfolder, device):
-
+        """
+        绘制和保存结果图像
+        
+        Args:
+            xi (torch.Tensor): 输入信号
+            pai (torch.Tensor): 真实相位误差
+            idx (list): 样本索引
+            prefixname (str): 文件名前缀
+            outfolder (str): 输出文件夹
+            device: 设备
+        """
         self.eval()
         with th.no_grad():
             xi, pai, = xi.to(device), pai.to(device)
